@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from fastapi import FastAPI
 
-from app.email_checker import check_email as check_email_result
+from app.micropython_wasm_checker import check_email_micropython_wasm
 
 app = FastAPI(title="fast-api-wasm-python")
 
@@ -28,4 +28,4 @@ def read_domains() -> list[str]:
 
 @app.post("/check")
 def check_email(request: CheckRequest) -> dict[str, str]:
-    return {"result": check_email_result(request.email, request.code)}
+    return {"result": check_email_micropython_wasm(request.email, request.code).result}
