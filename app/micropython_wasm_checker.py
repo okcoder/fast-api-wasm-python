@@ -7,6 +7,7 @@ Runs a configured MicroPython WASI/WASM binary when available. The fallback keep
 from dataclasses import dataclass
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import textwrap
@@ -26,7 +27,8 @@ class MicroPythonWasmResult:
 
 
 DEFAULT_RULE = """
-result = ("@" in email) and (code == "001")
+def check(email):
+    return "@" in email
 """
 
 
@@ -38,17 +40,50 @@ def _runtime_path() -> Path | None:
     return path if path.is_file() else None
 
 
-def check_email_micropython_wasm(email: str, code: str, user_code: str = DEFAULT_RULE) -> MicroPythonWasmResult:
+def _node_runner_path(runtime: Path) -> Path | None:
+    mjs = runtime.with_name("micropython.mjs")
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "micropython_wasm_runner.mjs"
+    return runner if mjs.is_file() and runner.is_file() else None
+
+
+def _run_with_node(runtime: Path, email: str, user_code: str, started: float) -> MicroPythonWasmResult:
+    runner = _node_runner_path(runtime)
+    if runner is None:
+        return MicroPythonWasmResult("NG", (time.perf_counter() - started) * 1000, "micropython.mjs or node runner is missing", True)
+    mjs = runtime.with_name("micropython.mjs")
+    try:
+        completed = subprocess.run(
+            ["node", str(runner), str(mjs), str(runtime), email, user_code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            env={"PATH": os.environ.get("PATH", "")},
+        )
+        payload = json.loads(completed.stdout or "{}")
+        error = payload.get("error")
+        if completed.returncode != 0 and error is None:
+            error = completed.stderr or "node runner failed"
+        return MicroPythonWasmResult(payload.get("result", "NG"), (time.perf_counter() - started) * 1000, error, True)
+    except subprocess.TimeoutExpired:
+        return MicroPythonWasmResult("NG", (time.perf_counter() - started) * 1000, "node runner timeout", True)
+    except Exception as exc:  # noqa: BLE001 - POC returns runtime errors as NG.
+        return MicroPythonWasmResult("NG", (time.perf_counter() - started) * 1000, str(exc), True)
+
+
+def check_email_micropython_wasm(email: str, user_code: str = DEFAULT_RULE) -> MicroPythonWasmResult:
     runtime = _runtime_path()
     if runtime is None:
         return MicroPythonWasmResult(
-            legacy_check_email(email, code),
+            legacy_check_email(email, ""),
             0.0,
             "MICROPYTHON_WASM is not configured; used legacy checker fallback",
             False,
         )
 
     started = time.perf_counter()
+    if _node_runner_path(runtime) is not None:
+        return _run_with_node(runtime, email, user_code, started)
     with tempfile.TemporaryDirectory(prefix="micropython-wasm-") as tmp:
         tmp_path = Path(tmp)
         rule = tmp_path / "rule.py"
@@ -58,9 +93,12 @@ def check_email_micropython_wasm(email: str, code: str, user_code: str = DEFAULT
             textwrap.dedent(
                 f"""
                 email = {email!r}
-                code = {code!r}
                 result = False
                 {textwrap.indent(user_code, '                ')}
+                try:
+                    result = check(email)
+                except NameError:
+                    pass
                 import json
                 print(json.dumps({{'result': 'OK' if result else 'NG'}}))
                 """

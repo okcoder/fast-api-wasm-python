@@ -24,12 +24,18 @@ def test_read_domains() -> None:
 
 
 def test_check_email_ok() -> None:
-    response = client.post("/check", json={"email": "user@example.com", "code": "001"})
+    response = client.post(
+        "/check",
+        json={"email": "user@example.com", "code": 'def check(email):\n    return "@" in email'},
+    )
     assert response.status_code == 200
     assert response.json() == {"result": "OK"}
 
 
 def test_check_email_ng() -> None:
-    response = client.post("/check", json={"email": "example.com", "code": "001"})
+    response = client.post(
+        "/check",
+        json={"email": "example.com", "code": 'def check(email):\n    return "@" in email'},
+    )
     assert response.status_code == 200
     assert response.json() == {"result": "NG"}
