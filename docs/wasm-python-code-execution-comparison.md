@@ -391,3 +391,42 @@ def check(email):
 - Pyodide + Node runner は、Host API連携が容易な一方で、PROD container制約下で運用可能か。
 - Native WASM module は、性能・隔離性の比較基準としてどの程度優れているか。
 - wasmtime-py embedded は、POC用途として十分か。本番ではsubprocess runnerへ移行すべきか。
+
+## OSSライブラリー採用時の確認ポイント
+
+WASM / Python実行基盤で利用するOSSライブラリーを選定する際は、最低限以下の4点を確認する。
+
+| 項目 | 確認内容 |
+|---|---|
+| License | 商用利用可能か |
+| Maintenance | 直近リリース・Issue対応 |
+| Security | CVE・Security Policy |
+| Fit | 要件に合うか |
+
+### License
+
+- 商用利用可能なライセンスか。
+- MIT / Apache-2.0 / BSD など、利用条件が許容可能か。
+- GPL / AGPL など、プロダクトへの影響が大きいライセンスではないか。
+- NOTICE表記や再配布条件がある場合、運用で対応可能か。
+
+### Maintenance
+
+- 直近リリースが継続的に行われているか。
+- Issue / PR が長期間放置されていないか。
+- メンテナーが複数いるか。
+- breaking change の頻度が許容可能か。
+
+### Security
+
+- 既知CVEがないか、または修正版が提供されているか。
+- Security Policy や脆弱性報告窓口があるか。
+- 脆弱性対応が十分に早いか。
+- 依存ライブラリを含めたsupply chain riskが許容可能か。
+
+### Fit
+
+- 今回の要件に合うか。
+- 既存FastAPI Python container内で利用できるか。
+- timeout / memory limit / sandbox / Host API連携など、必要な制御が可能か。
+- 将来的に差し替え可能な形で抽象化できるか。
