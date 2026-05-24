@@ -1,69 +1,110 @@
-"""wasmtime-py embedded POC with an explicit Host API allowlist."""
+"""wasmtime-py embedded POC that runs request Python code in CPython WASI."""
 
 from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import tempfile
 import time
 
 import wasmtime
+
+from app.email_checker import check_email as legacy_check_email
 
 
 @dataclass(frozen=True)
 class WasmtimeEmbeddedResult:
     result: str
     elapsed_ms: float
-    fuel_remaining: int
+    error: str | None = None
+    used_runtime: bool = False
+    fuel_remaining: int | None = None
 
 
-WAT_RULE = r"""
-(module
-  (import "host" "is_company_domain" (func $is_company_domain (param i32) (result i32)))
-  (func (export "check") (param $email_has_at i32) (param $domain_id i32) (param $code_is_001 i32) (result i32)
-    local.get $email_has_at
-    local.get $domain_id
-    call $is_company_domain
-    i32.and
-    local.get $code_is_001
-    i32.and)
-)
+DEFAULT_CODE = """
+def check(email):
+    return "@" in email
 """
 
-_DOMAIN_IDS = {
-    "example.com": 1,
-    "company.test": 2,
-}
-_ALLOWED_COMPANY_DOMAIN_IDS = {1}
+
+def _runtime_path() -> Path | None:
+    raw = os.environ.get("WASMTIME_EMBEDDED_PYTHON_WASM")
+    if not raw:
+        raw = os.environ.get("CPYTHON_WASI_WASM")
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_file() else None
 
 
-def _domain_id(email: str) -> int:
-    if "@" not in email:
-        return 0
-    return _DOMAIN_IDS.get(email.rsplit("@", 1)[1].lower(), 0)
-
-
-def _engine() -> wasmtime.Engine:
-    config = wasmtime.Config()
-    config.consume_fuel = True
-    return wasmtime.Engine(config)
-
-
-def check_email_wasmtime_embedded(email: str, code: str, *, fuel: int = 20_000) -> WasmtimeEmbeddedResult:
-    engine = _engine()
-    store = wasmtime.Store(engine)
-    store.set_fuel(fuel)
-    store.set_limits(memory_size=128 * 1024)
-
-    def is_company_domain(domain_id: int) -> int:
-        return int(domain_id in _ALLOWED_COMPANY_DOMAIN_IDS)
-
-    host_func = wasmtime.Func(
-        store,
-        wasmtime.FuncType([wasmtime.ValType.i32()], [wasmtime.ValType.i32()]),
-        is_company_domain,
-    )
-    module = wasmtime.Module(engine, WAT_RULE)
-    instance = wasmtime.Instance(store, module, [host_func])
-    check = instance.exports(store)["check"]
+def check_email_wasmtime_embedded(
+    email: str,
+    code: str = DEFAULT_CODE,
+    *,
+    fuel: int = 50_000_000_000,
+) -> WasmtimeEmbeddedResult:
+    runtime = _runtime_path()
+    if runtime is None:
+        return WasmtimeEmbeddedResult(
+            legacy_check_email(email, ""),
+            0.0,
+            "WASMTIME_EMBEDDED_PYTHON_WASM or CPYTHON_WASI_WASM is not configured; used legacy checker fallback",
+            False,
+            None,
+        )
 
     started = time.perf_counter()
-    ok = check(store, int("@" in email), _domain_id(email), int(code == "001"))
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    return WasmtimeEmbeddedResult("OK" if ok else "NG", elapsed_ms, store.get_fuel())
+    with tempfile.TemporaryDirectory(prefix="wasmtime-embedded-python-") as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / "input.json").write_text(json.dumps({"email": email}), encoding="utf-8")
+        rule_source = f"""import json
+data = json.load(open('/sandbox/input.json'))
+email = data['email']
+result = False
+{code}
+try:
+    result = check(email)
+except NameError:
+    pass
+print(json.dumps({{'result': 'OK' if result else 'NG'}}))
+"""
+        (tmp_path / "rule.py").write_text(rule_source, encoding="utf-8")
+        stdout = tmp_path / "stdout.txt"
+        stderr = tmp_path / "stderr.txt"
+
+        config = wasmtime.Config()
+        config.consume_fuel = True
+        engine = wasmtime.Engine(config)
+        store = wasmtime.Store(engine)
+        store.set_fuel(fuel)
+        store.set_limits(memory_size=256 * 1024 * 1024)
+
+        wasi = wasmtime.WasiConfig()
+        wasi.argv = (str(runtime), "-S", "/sandbox/rule.py")
+        wasi.preopen_dir(str(tmp_path), "/sandbox")
+        wasi.preopen_dir(str(runtime.parent), "/runtime")
+        wasi.env = (("PYTHONHOME", "/runtime"), ("PYTHONPATH", "/runtime/lib/python3.13"))
+        wasi.stdout_file = str(stdout)
+        wasi.stderr_file = str(stderr)
+        store.set_wasi(wasi)
+
+        linker = wasmtime.Linker(engine)
+        linker.define_wasi()
+
+        try:
+            module = wasmtime.Module.from_file(engine, str(runtime))
+            instance = linker.instantiate(store, module)
+            start = instance.exports(store).get("_start")
+            if start is None:
+                return WasmtimeEmbeddedResult("NG", (time.perf_counter() - started) * 1000, "runtime has no _start", True, store.get_fuel())
+            start(store)
+        except Exception as exc:  # noqa: BLE001 - POC reports runtime failures as NG.
+            err = stderr.read_text(encoding="utf-8") if stderr.exists() else ""
+            return WasmtimeEmbeddedResult("NG", (time.perf_counter() - started) * 1000, f"{exc}; {err}", True, store.get_fuel())
+
+        try:
+            data = json.loads(stdout.read_text(encoding="utf-8").strip().splitlines()[-1])
+        except Exception as exc:  # noqa: BLE001
+            err = stderr.read_text(encoding="utf-8") if stderr.exists() else ""
+            return WasmtimeEmbeddedResult("NG", (time.perf_counter() - started) * 1000, f"invalid output: {exc}; {err}", True, store.get_fuel())
+        return WasmtimeEmbeddedResult(data.get("result", "NG"), (time.perf_counter() - started) * 1000, None, True, store.get_fuel())
